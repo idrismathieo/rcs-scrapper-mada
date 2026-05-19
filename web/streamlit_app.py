@@ -160,45 +160,75 @@ CSS = """
         transform: translateY(-1px);
     }
 
-    /* === Progress card === */
+    /* === Progress card (custom, full HTML) === */
     .progress-card {
         background: #FFFFFF;
         border: 1px solid #E5E7EB;
         border-radius: 14px;
         padding: 1.6rem;
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        margin-bottom: 0.5rem;
     }
     .progress-header {
         display: flex;
         justify-content: space-between;
-        align-items: baseline;
-        margin-bottom: 1rem;
+        align-items: flex-start;
+        gap: 1rem;
+        margin-bottom: 1.1rem;
     }
     .progress-phase {
-        font-size: 0.95rem;
+        font-size: 0.98rem;
         font-weight: 600;
         color: #0F172A;
+        line-height: 1.3;
     }
     .progress-detail {
-        font-size: 0.85rem;
+        font-size: 0.84rem;
         color: #64748B;
         margin-top: 4px;
+        line-height: 1.4;
     }
     .progress-pct {
-        font-size: 1.5rem;
+        font-size: 1.55rem;
         font-weight: 700;
         color: #4F46E5;
         font-variant-numeric: tabular-nums;
+        flex-shrink: 0;
+        line-height: 1;
     }
-
-    .stProgress > div > div > div {
-        background: linear-gradient(90deg, #6366F1 0%, #4F46E5 100%) !important;
+    .progress-track {
+        width: 100%;
+        height: 8px;
+        background: #EEF2FF;
         border-radius: 999px;
+        overflow: hidden;
+        position: relative;
     }
-    .stProgress > div > div {
-        background-color: #EEF2FF !important;
+    .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #6366F1 0%, #4F46E5 100%);
         border-radius: 999px;
-        height: 8px !important;
+        transition: width 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .progress-fill.indeterminate {
+        width: 40%;
+        animation: progress-indeterminate 1.5s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    }
+    @keyframes progress-indeterminate {
+        0%   { transform: translateX(-150%); }
+        100% { transform: translateX(350%); }
+    }
+    .progress-meta {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 0.9rem;
+        font-size: 0.85rem;
+        color: #64748B;
+    }
+    .progress-meta strong {
+        color: #0F172A;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
     }
 
     /* === Stepper === */
@@ -431,7 +461,8 @@ with st.form("scraper_form", clear_on_submit=False, border=False):
         greffe = st.selectbox(
             "Ville (greffe)",
             options=greffes_sorted,
-            index=greffes_sorted.index("Nosy Be"),
+            index=None,
+            placeholder="Choisir une ville...",
             help="La ville d'immatriculation au RCS",
         )
     with col2:
@@ -543,8 +574,47 @@ def render_stepper(active: int):
     return html
 
 
+def _render_progress_card(phase, detail="", current=0, total=0, eta=0, pct=None):
+    """Génère l'HTML complet de la carte de progression (une seule markdown call)."""
+    pct_display = "—" if pct is None else f"{pct}%"
+    if pct is None:
+        fill_html = '<div class="progress-fill indeterminate"></div>'
+    else:
+        fill_html = f'<div class="progress-fill" style="width: {pct}%;"></div>'
+
+    detail_html = f'<div class="progress-detail">{detail}</div>' if detail else ""
+
+    meta_html = ""
+    if total > 0:
+        eta_str = f"~{format_duration(eta)} restant" if eta > 0 else "Bientôt terminé"
+        meta_html = (
+            f'<div class="progress-meta">'
+            f'<span><strong>{current}</strong> sur <strong>{total}</strong></span>'
+            f'<span>{eta_str}</span>'
+            f'</div>'
+        )
+
+    return f"""
+<div class="progress-card">
+    <div class="progress-header">
+        <div>
+            <div class="progress-phase">{phase}</div>
+            {detail_html}
+        </div>
+        <div class="progress-pct">{pct_display}</div>
+    </div>
+    <div class="progress-track">
+        {fill_html}
+    </div>
+    {meta_html}
+</div>
+"""
+
+
 # === Run scraping ===
-if launch:
+if launch and greffe is None:
+    st.warning("Veuillez d'abord choisir une ville avant de lancer l'extraction.")
+elif launch:
     st.session_state.result = None
     st.session_state.error = None
     st.session_state.running = True
@@ -554,24 +624,19 @@ if launch:
     stepper_placeholder = st.empty()
     stepper_placeholder.markdown(render_stepper(1), unsafe_allow_html=True)
 
-    progress_container = st.container()
-    with progress_container:
-        st.markdown('<div class="progress-card">', unsafe_allow_html=True)
-        header_placeholder = st.empty()
-        progress_bar = st.progress(0.0)
-        meta_placeholder = st.empty()
-        st.markdown("</div>", unsafe_allow_html=True)
+    progress_placeholder = st.empty()
+    progress_placeholder.markdown(
+        _render_progress_card(phase="Connexion au serveur..."),
+        unsafe_allow_html=True,
+    )
 
     start = time.time()
-    state = {"phase": 1, "total_known": False}
+    state = {"total_known": False}
 
     def progress_cb(event, **kwargs):
         if event == "status":
-            msg = kwargs.get("message", "")
-            header_placeholder.markdown(
-                f'<div class="progress-header">'
-                f'<div><div class="progress-phase">{msg}</div></div>'
-                f'<div class="progress-pct">—</div></div>',
+            progress_placeholder.markdown(
+                _render_progress_card(phase=kwargs.get("message", "")),
                 unsafe_allow_html=True,
             )
         elif event == "progress":
@@ -582,32 +647,19 @@ if launch:
 
             if total > 0 and not state["total_known"]:
                 state["total_known"] = True
-                state["phase"] = 2
                 stepper_placeholder.markdown(render_stepper(2), unsafe_allow_html=True)
 
             if total > 0:
-                pct = min(max(current / total, 0.0), 1.0)
-                progress_bar.progress(pct)
+                pct = int(min(max(current / total, 0.0), 1.0) * 100)
                 detail = msg if msg else f"{current}/{total} entreprises"
                 if len(detail) > 60:
                     detail = detail[:57] + "..."
-                header_placeholder.markdown(
-                    f'<div class="progress-header">'
-                    f'<div>'
-                    f'<div class="progress-phase">Récupération des détails</div>'
-                    f'<div class="progress-detail">{detail}</div>'
-                    f'</div>'
-                    f'<div class="progress-pct">{int(pct * 100)}%</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-                eta_str = f"~{format_duration(eta)} restant" if eta > 0 else "Bientôt terminé"
-                meta_placeholder.markdown(
-                    f'<div style="display:flex; justify-content:space-between; '
-                    f'font-size:0.85rem; color:#64748B; margin-top:0.6rem;">'
-                    f'<span><strong style="color:#0F172A;">{current}</strong> sur <strong style="color:#0F172A;">{total}</strong></span>'
-                    f'<span>{eta_str}</span>'
-                    f'</div>',
+                progress_placeholder.markdown(
+                    _render_progress_card(
+                        phase="Récupération des détails",
+                        detail=detail,
+                        current=current, total=total, eta=eta, pct=pct,
+                    ),
                     unsafe_allow_html=True,
                 )
 
@@ -619,13 +671,10 @@ if launch:
         )
 
         stepper_placeholder.markdown(render_stepper(3), unsafe_allow_html=True)
-        header_placeholder.markdown(
-            '<div class="progress-header">'
-            '<div><div class="progress-phase">Génération du fichier Excel</div></div>'
-            '<div class="progress-pct">100%</div></div>',
+        progress_placeholder.markdown(
+            _render_progress_card(phase="Génération du fichier Excel", pct=100),
             unsafe_allow_html=True,
         )
-        progress_bar.progress(1.0)
 
         wb = build_workbook(rows, {
             "greffe": greffe, "annee": str(annee),
@@ -638,7 +687,7 @@ if launch:
 
         elapsed = time.time() - start
 
-        progress_container.empty()
+        progress_placeholder.empty()
         stepper_placeholder.empty()
 
         st.session_state.result = {
@@ -654,7 +703,7 @@ if launch:
         }
         st.session_state.running = False
     except Exception as exc:
-        progress_container.empty()
+        progress_placeholder.empty()
         stepper_placeholder.empty()
         st.session_state.error = exc
         st.session_state.running = False
