@@ -710,14 +710,3 @@ if st.session_state.result:
     st.caption(f"Nom du fichier : `{r['filename']}`")
 
 
-# === Footer ===
-st.markdown(
-    """
-<div class="app-footer">
-    © 2026 Tous droits réservés
-    <span class="footer-divider">·</span>
-    Idris Mathieo
-</div>
-""",
-    unsafe_allow_html=True,
-)
