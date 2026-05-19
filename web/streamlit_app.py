@@ -716,7 +716,7 @@ st.markdown(
 <div class="app-footer">
     © 2026 Tous droits réservés
     <span class="footer-divider">·</span>
-    Angola Razafimahefa
+    Idris Mathieo
 </div>
 """,
     unsafe_allow_html=True,
