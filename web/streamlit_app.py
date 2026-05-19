@@ -5,6 +5,7 @@ Lancer en local : streamlit run streamlit_app.py
 """
 
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -441,8 +442,12 @@ if "result" not in st.session_state:
     st.session_state.result = None
 if "error" not in st.session_state:
     st.session_state.error = None
-if "running" not in st.session_state:
-    st.session_state.running = False
+if "job" not in st.session_state:
+    st.session_state.job = None
+
+# Détecte si un scraping est actuellement en cours
+_active_job = st.session_state.job
+_is_running = _active_job is not None and not _active_job.state["done"]
 
 
 # === Form ===
@@ -491,7 +496,11 @@ with st.form("scraper_form", clear_on_submit=False, border=False):
     type_code = type_keys[type_labels.index(type_label)]
 
     st.write("")
-    launch = st.form_submit_button("Lancer l'extraction", type="primary", use_container_width=True)
+    launch = st.form_submit_button(
+        "Extraction en cours..." if _is_running else "Lancer l'extraction",
+        type="primary", use_container_width=True,
+        disabled=_is_running,
+    )
 
 
 # === Helpers ===
@@ -574,6 +583,113 @@ def render_stepper(active: int):
     return html
 
 
+class ExtractionJob:
+    """Encapsule un scraping dans un thread avec support de l'annulation.
+    Streamlit est synchrone : sans thread, un clic sur 'Annuler' pendant le scraping
+    serait queueé et jamais traité avant la fin du scraping."""
+
+    def __init__(self, params):
+        self.params = params
+        self.start_time = time.time()
+        self._cancel_event = threading.Event()
+        self._lock = threading.Lock()
+        self._state = {
+            "stage": 1,
+            "phase": "Connexion au serveur...",
+            "detail": "",
+            "current": 0,
+            "total": 0,
+            "eta": 0,
+            "pct": None,
+            "result": None,
+            "error": None,
+            "done": False,
+        }
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def is_cancelled(self):
+        return self._cancel_event.is_set()
+
+    @property
+    def state(self):
+        with self._lock:
+            return dict(self._state)
+
+    def _update(self, **changes):
+        with self._lock:
+            self._state.update(changes)
+
+    def _run(self):
+        try:
+            def cb(event, **kwargs):
+                if self._cancel_event.is_set():
+                    raise InterruptedError("cancelled")
+                if event == "status":
+                    self._update(phase=kwargs.get("message", ""), pct=None, detail="")
+                elif event == "progress":
+                    current = kwargs.get("current", 0)
+                    total = kwargs.get("total", 0)
+                    msg = kwargs.get("message", "")
+                    eta = kwargs.get("eta", 0)
+                    if total > 0 and self.state["stage"] < 2:
+                        self._update(stage=2)
+                    if total > 0:
+                        pct = int(min(max(current / total, 0.0), 1.0) * 100)
+                        detail = (msg[:57] + "...") if len(msg) > 60 else msg
+                        self._update(
+                            phase="Récupération des détails",
+                            detail=detail,
+                            current=current, total=total,
+                            eta=eta, pct=pct,
+                        )
+
+            session = make_session()
+            rows = extract_entreprises(
+                session,
+                self.params["type"], self.params["greffe_id"],
+                str(self.params["annee"]), self.params["forme"],
+                sleep_s=1.0, progress_cb=cb, quiet=True,
+            )
+
+            if self._cancel_event.is_set():
+                raise InterruptedError("cancelled")
+
+            self._update(stage=3, phase="Génération du fichier Excel", pct=100, detail="")
+
+            wb = build_workbook(rows, {
+                "greffe": self.params["greffe"], "annee": str(self.params["annee"]),
+                "forme": self.params["forme"], "type": self.params["type"],
+            })
+            buffer = BytesIO()
+            wb.save(buffer)
+            excel_bytes = buffer.getvalue()
+
+            self._update(
+                result={
+                    "excel": excel_bytes,
+                    "filename": f"rcs_{self.params['greffe'].replace(' ', '_')}_{self.params['annee']}_{self.params['forme']}.xlsx",
+                    "count": len(rows),
+                    "elapsed": time.time() - self.start_time,
+                    "size_kb": len(excel_bytes) / 1024,
+                    "greffe": self.params["greffe"],
+                    "annee": self.params["annee"],
+                    "forme": self.params["forme"],
+                    "type_label": self.params["type_label"],
+                },
+                done=True,
+            )
+        except InterruptedError:
+            self._update(error="cancelled", done=True)
+        except Exception as exc:
+            self._update(error=exc, done=True)
+
+
 def _render_progress_card(phase, detail="", current=0, total=0, eta=0, pct=None):
     """Génère l'HTML complet de la carte de progression (une seule markdown call).
     Pas d'indentation : Markdown traite les lignes indentées de 4+ espaces comme du code."""
@@ -606,102 +722,69 @@ def _render_progress_card(phase, detail="", current=0, total=0, eta=0, pct=None)
     )
 
 
-# === Run scraping ===
-if launch and greffe is None:
-    st.warning("Veuillez d'abord choisir une ville avant de lancer l'extraction.")
-elif launch:
-    st.session_state.result = None
-    st.session_state.error = None
-    st.session_state.running = True
-
-    st.markdown('<div class="section-title">Progression en cours</div>', unsafe_allow_html=True)
-
-    stepper_placeholder = st.empty()
-    stepper_placeholder.markdown(render_stepper(1), unsafe_allow_html=True)
-
-    progress_placeholder = st.empty()
-    progress_placeholder.markdown(
-        _render_progress_card(phase="Connexion au serveur..."),
-        unsafe_allow_html=True,
-    )
-
-    start = time.time()
-    state = {"total_known": False}
-
-    def progress_cb(event, **kwargs):
-        if event == "status":
-            progress_placeholder.markdown(
-                _render_progress_card(phase=kwargs.get("message", "")),
-                unsafe_allow_html=True,
-            )
-        elif event == "progress":
-            current = kwargs.get("current", 0)
-            total = kwargs.get("total", 0)
-            msg = kwargs.get("message", "")
-            eta = kwargs.get("eta", 0)
-
-            if total > 0 and not state["total_known"]:
-                state["total_known"] = True
-                stepper_placeholder.markdown(render_stepper(2), unsafe_allow_html=True)
-
-            if total > 0:
-                pct = int(min(max(current / total, 0.0), 1.0) * 100)
-                detail = msg if msg else f"{current}/{total} entreprises"
-                if len(detail) > 60:
-                    detail = detail[:57] + "..."
-                progress_placeholder.markdown(
-                    _render_progress_card(
-                        phase="Récupération des détails",
-                        detail=detail,
-                        current=current, total=total, eta=eta, pct=pct,
-                    ),
-                    unsafe_allow_html=True,
-                )
-
-    try:
-        session = make_session()
-        rows = extract_entreprises(
-            session, type_code, GREFFE_MAP[greffe], str(annee), forme,
-            sleep_s=1.0, progress_cb=progress_cb, quiet=True,
-        )
-
-        stepper_placeholder.markdown(render_stepper(3), unsafe_allow_html=True)
-        progress_placeholder.markdown(
-            _render_progress_card(phase="Génération du fichier Excel", pct=100),
-            unsafe_allow_html=True,
-        )
-
-        wb = build_workbook(rows, {
-            "greffe": greffe, "annee": str(annee),
-            "forme": forme, "type": type_code,
-        })
-        buffer = BytesIO()
-        wb.save(buffer)
-        excel_bytes = buffer.getvalue()
-        file_size_kb = len(excel_bytes) / 1024
-
-        elapsed = time.time() - start
-
-        progress_placeholder.empty()
-        stepper_placeholder.empty()
-
-        st.session_state.result = {
-            "excel": excel_bytes,
-            "filename": f"rcs_{greffe.replace(' ', '_')}_{annee}_{forme}.xlsx",
-            "count": len(rows),
-            "elapsed": elapsed,
-            "size_kb": file_size_kb,
+# === Lancement (démarrage d'un nouveau job thread) ===
+if launch and not _is_running:
+    if greffe is None:
+        st.warning("Veuillez d'abord choisir une ville avant de lancer l'extraction.")
+    else:
+        st.session_state.result = None
+        st.session_state.error = None
+        job = ExtractionJob({
+            "type": type_code,
+            "greffe_id": GREFFE_MAP[greffe],
             "greffe": greffe,
             "annee": annee,
             "forme": forme,
             "type_label": type_label,
-        }
-        st.session_state.running = False
-    except Exception as exc:
-        progress_placeholder.empty()
-        stepper_placeholder.empty()
-        st.session_state.error = exc
-        st.session_state.running = False
+        })
+        st.session_state.job = job
+        job.start()
+        _active_job = job
+        _is_running = True
+        st.rerun()
+
+# === Rendu pendant qu'un job tourne (avec polling et bouton Annuler) ===
+if _active_job is not None:
+    job_state = _active_job.state
+
+    if not job_state["done"]:
+        st.markdown('<div class="section-title">Progression en cours</div>', unsafe_allow_html=True)
+        st.markdown(render_stepper(job_state["stage"]), unsafe_allow_html=True)
+        st.markdown(
+            _render_progress_card(
+                phase=job_state["phase"],
+                detail=job_state["detail"],
+                current=job_state["current"],
+                total=job_state["total"],
+                eta=job_state["eta"],
+                pct=job_state["pct"],
+            ),
+            unsafe_allow_html=True,
+        )
+        st.write("")
+        if st.button("Annuler l'extraction", use_container_width=True, key="cancel_btn"):
+            _active_job.cancel()
+            st.toast("Annulation demandée, arrêt en cours...", icon="⏸")
+
+        # Polling : on réinvoque le script toutes les 0.6s pour rafraîchir la progression
+        time.sleep(0.6)
+        st.rerun()
+    else:
+        # Le job vient de se terminer : on déplace son résultat dans le session_state principal
+        if job_state["error"] == "cancelled":
+            st.session_state.job = None
+            st.session_state.result = None
+            st.session_state.error = None
+            st.toast("Extraction annulée.", icon="✕")
+            st.rerun()
+        elif job_state["error"] is not None:
+            st.session_state.error = job_state["error"]
+            st.session_state.job = None
+            st.rerun()
+        elif job_state["result"] is not None:
+            st.session_state.result = job_state["result"]
+            st.session_state.job = None
+            st.rerun()
 
 
 # === Result display ===
