@@ -575,13 +575,13 @@ def render_stepper(active: int):
 
 
 def _render_progress_card(phase, detail="", current=0, total=0, eta=0, pct=None):
-    """Génère l'HTML complet de la carte de progression (une seule markdown call)."""
+    """Génère l'HTML complet de la carte de progression (une seule markdown call).
+    Pas d'indentation : Markdown traite les lignes indentées de 4+ espaces comme du code."""
     pct_display = "—" if pct is None else f"{pct}%"
-    if pct is None:
-        fill_html = '<div class="progress-fill indeterminate"></div>'
-    else:
-        fill_html = f'<div class="progress-fill" style="width: {pct}%;"></div>'
-
+    fill_html = (
+        '<div class="progress-fill indeterminate"></div>' if pct is None
+        else f'<div class="progress-fill" style="width: {pct}%;"></div>'
+    )
     detail_html = f'<div class="progress-detail">{detail}</div>' if detail else ""
 
     meta_html = ""
@@ -594,21 +594,16 @@ def _render_progress_card(phase, detail="", current=0, total=0, eta=0, pct=None)
             f'</div>'
         )
 
-    return f"""
-<div class="progress-card">
-    <div class="progress-header">
-        <div>
-            <div class="progress-phase">{phase}</div>
-            {detail_html}
-        </div>
-        <div class="progress-pct">{pct_display}</div>
-    </div>
-    <div class="progress-track">
-        {fill_html}
-    </div>
-    {meta_html}
-</div>
-"""
+    return (
+        f'<div class="progress-card">'
+        f'<div class="progress-header">'
+        f'<div><div class="progress-phase">{phase}</div>{detail_html}</div>'
+        f'<div class="progress-pct">{pct_display}</div>'
+        f'</div>'
+        f'<div class="progress-track">{fill_html}</div>'
+        f'{meta_html}'
+        f'</div>'
+    )
 
 
 # === Run scraping ===
